@@ -443,11 +443,10 @@ func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		}
 	}()
 
-	var spanRPC opentracing.Span
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		spanRPC = span.Tracer().StartSpan(fmt.Sprintf("rpcClient.SendRequest, region ID: %d, type: %s", req.RegionId, req.Type), opentracing.ChildOf(span.Context()))
-		defer spanRPC.Finish()
-		ctx = opentracing.ContextWithSpan(ctx, spanRPC)
+		span1 := span.Tracer().StartSpan(fmt.Sprintf("rpcClient.SendRequest, region ID: %d, type: %s", req.RegionId, req.Type), opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
 
 	if atomic.CompareAndSwapUint32(&c.idleNotify, 1, 0) {
