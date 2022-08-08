@@ -375,9 +375,8 @@ func (c *RPCClient) closeConns() {
 }
 
 var (
-	sendReqHistCache       sync.Map
-	sendReqCounterCache    sync.Map
-	rpcNetLatencyHistCache sync.Map
+	sendReqHistCache    sync.Map
+	sendReqCounterCache sync.Map
 )
 
 type sendReqHistCacheKey struct {
@@ -396,14 +395,10 @@ type sendReqCounterCacheValue struct {
 	timeCounter prometheus.Counter
 }
 
-func (c *RPCClient) updateTiKVSendReqHistogram(req *tikvrpc.Request, resp *tikvrpc.Response, start time.Time, staleRead bool) {
-	elapsed := time.Since(start)
-	secs := elapsed.Seconds()
-	storeID := req.Context.GetPeer().GetStoreId()
-
+func (c *RPCClient) updateTiKVSendReqHistogram(req *tikvrpc.Request, start time.Time, staleRead bool) {
 	histKey := sendReqHistCacheKey{
 		req.Type,
-		storeID,
+		req.Context.GetPeer().GetStoreId(),
 		staleRead,
 	}
 	counterKey := sendReqCounterCacheKey{
@@ -411,46 +406,28 @@ func (c *RPCClient) updateTiKVSendReqHistogram(req *tikvrpc.Request, resp *tikvr
 		req.GetRequestSource(),
 	}
 
-	reqType := req.Type.String()
-	var storeIDStr string
-
 	hist, ok := sendReqHistCache.Load(histKey)
 	if !ok {
-		if len(storeIDStr) == 0 {
-			storeIDStr = strconv.FormatUint(storeID, 10)
-		}
-		hist = metrics.TiKVSendReqHistogram.WithLabelValues(reqType, storeIDStr, strconv.FormatBool(staleRead))
+		reqType := req.Type.String()
+		storeID := strconv.FormatUint(req.Context.GetPeer().GetStoreId(), 10)
+		hist = metrics.TiKVSendReqHistogram.WithLabelValues(reqType, storeID, strconv.FormatBool(staleRead))
 		sendReqHistCache.Store(histKey, hist)
 	}
 	counter, ok := sendReqCounterCache.Load(counterKey)
 	if !ok {
-		if len(storeIDStr) == 0 {
-			storeIDStr = strconv.FormatUint(storeID, 10)
-		}
+		reqType := req.Type.String()
+		storeID := strconv.FormatUint(req.Context.GetPeer().GetStoreId(), 10)
 		counter = sendReqCounterCacheValue{
-			metrics.TiKVSendReqCounter.WithLabelValues(reqType, storeIDStr, strconv.FormatBool(staleRead), counterKey.requestSource),
-			metrics.TiKVSendReqTimeCounter.WithLabelValues(reqType, storeIDStr, strconv.FormatBool(staleRead), counterKey.requestSource),
+			metrics.TiKVSendReqCounter.WithLabelValues(reqType, storeID, strconv.FormatBool(staleRead), counterKey.requestSource),
+			metrics.TiKVSendReqTimeCounter.WithLabelValues(reqType, storeID, strconv.FormatBool(staleRead), counterKey.requestSource),
 		}
 		sendReqCounterCache.Store(counterKey, counter)
 	}
 
+	secs := time.Since(start).Seconds()
 	hist.(prometheus.Observer).Observe(secs)
 	counter.(sendReqCounterCacheValue).counter.Inc()
 	counter.(sendReqCounterCacheValue).timeCounter.Add(secs)
-
-	if execDetail := resp.GetExecDetailsV2(); execDetail != nil &&
-		execDetail.TimeDetail != nil && execDetail.TimeDetail.TotalRpcWallTimeNs > 0 {
-		latHist, ok := rpcNetLatencyHistCache.Load(storeID)
-		if !ok {
-			if len(storeIDStr) == 0 {
-				storeIDStr = strconv.FormatUint(storeID, 10)
-			}
-			latHist = metrics.TiKVRPCNetLatencyHistogram.WithLabelValues(storeIDStr)
-			sendReqHistCache.Store(storeID, latHist)
-		}
-		latency := elapsed - time.Duration(execDetail.TimeDetail.TotalRpcWallTimeNs)*time.Nanosecond
-		latHist.(prometheus.Observer).Observe(latency.Seconds())
-	}
 }
 
 func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (resp *tikvrpc.Response, err error) {
@@ -481,13 +458,7 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 			detail := stmtExec.(*util.ExecDetails)
 			atomic.AddInt64(&detail.WaitKVRespDuration, int64(time.Since(start)))
 		}
-		c.updateTiKVSendReqHistogram(req, resp, start, staleRead)
-
-		if spanRPC != nil && util.TraceExecDetailsEnabled(ctx) {
-			if si := buildSpanInfoFromResp(resp); si != nil {
-				si.addTo(spanRPC, start)
-			}
-		}
+		c.updateTiKVSendReqHistogram(req, start, staleRead)
 	}()
 
 	// TiDB RPC server supports batch RPC, but batch connection will send heart beat, It's not necessary since
@@ -740,58 +711,4 @@ func (si *spanInfo) String() string {
 	buf := new(strings.Builder)
 	si.printTo(buf)
 	return buf.String()
-}
-
-func buildSpanInfoFromResp(resp *tikvrpc.Response) *spanInfo {
-	details := resp.GetExecDetailsV2()
-	if details == nil {
-		return nil
-	}
-
-	td := details.TimeDetail
-	sd := details.ScanDetailV2
-	wd := details.WriteDetail
-
-	if td == nil {
-		return nil
-	}
-
-	spanRPC := spanInfo{name: "tikv.RPC", dur: td.TotalRpcWallTimeNs}
-	spanWait := spanInfo{name: "tikv.Wait", dur: td.WaitWallTimeMs * uint64(time.Millisecond)}
-	spanProcess := spanInfo{name: "tikv.Process", dur: td.ProcessWallTimeMs * uint64(time.Millisecond)}
-
-	if sd != nil {
-		spanWait.children = append(spanWait.children, spanInfo{name: "tikv.GetSnapshot", dur: sd.GetSnapshotNanos})
-		if wd == nil {
-			spanProcess.children = append(spanProcess.children, spanInfo{name: "tikv.RocksDBBlockRead", dur: sd.RocksdbBlockReadNanos})
-		}
-	}
-
-	spanRPC.children = append(spanRPC.children, spanWait, spanProcess)
-
-	if wd != nil {
-		spanAsyncWrite := spanInfo{
-			name: "tikv.AsyncWrite",
-			children: []spanInfo{
-				{name: "tikv.StoreBatchWait", dur: wd.StoreBatchWaitNanos},
-				{name: "tikv.ProposeSendWait", dur: wd.ProposeSendWaitNanos},
-				{name: "tikv.PersistLog", dur: wd.PersistLogNanos, async: true, children: []spanInfo{
-					{name: "tikv.RaftDBWriteWait", dur: wd.RaftDbWriteLeaderWaitNanos}, // MutexLock + WriteLeader
-					{name: "tikv.RaftDBWriteWAL", dur: wd.RaftDbSyncLogNanos},
-					{name: "tikv.RaftDBWriteMemtable", dur: wd.RaftDbWriteMemtableNanos},
-				}},
-				{name: "tikv.CommitLog", dur: wd.CommitLogNanos},
-				{name: "tikv.ApplyBatchWait", dur: wd.ApplyBatchWaitNanos},
-				{name: "tikv.ApplyLog", dur: wd.ApplyLogNanos, children: []spanInfo{
-					{name: "tikv.ApplyMutexLock", dur: wd.ApplyMutexLockNanos},
-					{name: "tikv.ApplyWriteLeaderWait", dur: wd.ApplyWriteLeaderWaitNanos},
-					{name: "tikv.ApplyWriteWAL", dur: wd.ApplyWriteWalNanos},
-					{name: "tikv.ApplyWriteMemtable", dur: wd.ApplyWriteMemtableNanos},
-				}},
-			},
-		}
-		spanRPC.children = append(spanRPC.children, spanAsyncWrite)
-	}
-
-	return &spanRPC
 }
