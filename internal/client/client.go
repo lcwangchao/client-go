@@ -430,7 +430,19 @@ func (c *RPCClient) updateTiKVSendReqHistogram(req *tikvrpc.Request, start time.
 	counter.(sendReqCounterCacheValue).timeCounter.Add(secs)
 }
 
-func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (resp *tikvrpc.Response, err error) {
+// SendRequest sends a Request to server and receives Response.
+func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (resp *tikvrpc.Response, err error) {
+	req, err = EncodeRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err == nil {
+			resp, err = DecodeResponse(req, resp)
+		}
+	}()
+
 	var spanRPC opentracing.Span
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
 		spanRPC = span.Tracer().StartSpan(fmt.Sprintf("rpcClient.SendRequest, region ID: %d, type: %s", req.RegionId, req.Type), opentracing.ChildOf(span.Context()))
@@ -501,19 +513,6 @@ func (c *RPCClient) sendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	ctx1, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return tikvrpc.CallRPC(ctx1, client, req)
-}
-
-// SendRequest sends a Request to server and receives Response.
-func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
-	req, err := EncodeRequest(req)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.sendRequest(ctx, addr, req, timeout)
-	if err != nil {
-		return nil, err
-	}
-	return DecodeResponse(req, resp)
 }
 
 func (c *RPCClient) getCopStreamResponse(ctx context.Context, client tikvpb.TikvClient, req *tikvrpc.Request, timeout time.Duration, connArray *connArray) (*tikvrpc.Response, error) {
