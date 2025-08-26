@@ -21,6 +21,7 @@ import (
 	"github.com/tikv/client-go/v2/internal/client"
 	"github.com/tikv/client-go/v2/internal/locate"
 	"github.com/tikv/client-go/v2/internal/logutil"
+	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/metrics"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/util/async"
@@ -43,7 +44,7 @@ func (s *KVSnapshot) asyncBatchGetByRegions(
 	bo *retry.Backoffer,
 	batches []batchKeys,
 	readTier int,
-	collectF func(k, v []byte),
+	collectF func(k []byte, v kv.ValueItem),
 ) (err error) {
 	var (
 		runloop      = async.NewRunLoop()
@@ -90,7 +91,7 @@ func (s *KVSnapshot) tryBatchGetSingleRegionUsingAsyncAPI(
 	bo *retry.Backoffer,
 	batch batchKeys,
 	readTier int,
-	collectF func(k, v []byte),
+	collectF func(k []byte, v kv.ValueItem),
 	cb async.Callback[struct{}],
 ) {
 	cli := NewClientHelper(s.store, &s.resolvedLocks, &s.committedLocks, false)
@@ -196,7 +197,7 @@ func (s *KVSnapshot) retryBatchGetSingleRegionAfterAsyncAPI(
 	readType string,
 	regionErr *errorpb.Error,
 	lockInfo *batchGetLockInfo,
-	collectF func(k, v []byte),
+	collectF func(k []byte, v kv.ValueItem),
 ) error {
 	var (
 		resolvingRecordToken  *int

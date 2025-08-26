@@ -54,7 +54,7 @@ type PipelinedMemDB struct {
 	//   None -> not found
 	//   Some([...]) -> put
 	//   Some([]) -> delete
-	batchGetCache map[string]util.Option[[]byte]
+	batchGetCache map[string]util.Option[kv.ValueItem]
 	memChangeHook func(uint64)
 
 	// metrics
@@ -100,7 +100,7 @@ func newFlushOption() flushOption {
 }
 
 type FlushFunc func(uint64, *MemDB) error
-type BufferBatchGetter func(ctx context.Context, keys [][]byte) (map[string][]byte, error)
+type BufferBatchGetter func(ctx context.Context, keys [][]byte) (map[string]kv.ValueItem, error)
 
 func NewPipelinedMemDB(bufferBatchGetter BufferBatchGetter, flushFunc FlushFunc) *PipelinedMemDB {
 	memdb := NewMemDB()
@@ -130,63 +130,67 @@ func (p *PipelinedMemDB) GetMemDB() *MemDB {
 	panic("GetMemDB should not be invoked for PipelinedMemDB")
 }
 
-func (p *PipelinedMemDB) get(ctx context.Context, k []byte, skipRemoteBuffer bool) ([]byte, error) {
-	v, err := p.memDB.Get(ctx, k)
+func (p *PipelinedMemDB) get(ctx context.Context, k []byte, skipRemoteBuffer bool) (v kv.ValueItem, _ error) {
+	rawV, err := p.memDB.Get(ctx, k)
 	if err == nil {
 		return v, nil
 	}
 	if !tikverr.IsErrNotFound(err) {
-		return nil, err
+		return v, err
 	}
 	if p.flushingMemDB != nil {
-		v, err = p.flushingMemDB.Get(ctx, k)
+		rawV, err = p.flushingMemDB.Get(ctx, k)
 		if err == nil {
 			return v, nil
 		}
 		if !tikverr.IsErrNotFound(err) {
-			return nil, err
+			return v, err
 		}
 	}
 	if skipRemoteBuffer {
-		return nil, tikverr.ErrNotExist
+		return v, tikverr.ErrNotExist
 	}
 	if p.batchGetCache != nil {
-		v, ok := p.batchGetCache[string(k)]
+		optV, ok := p.batchGetCache[string(k)]
 		if ok {
-			inner := v.Inner()
+			inner := optV.Inner()
 			if inner == nil {
-				return nil, tikverr.ErrNotExist
+				return v, tikverr.ErrNotExist
 			}
 			return *inner, nil
 		}
 	}
 	// read remote buffer
 	var (
-		dataMap map[string][]byte
+		dataMap map[string]kv.ValueItem
 		ok      bool
 	)
 	dataMap, err = p.bufferBatchGetter(ctx, [][]byte{k})
 	if err != nil {
-		return nil, err
+		return v, err
 	}
 	v, ok = dataMap[string(k)]
 	if !ok {
-		return nil, tikverr.ErrNotExist
+		return v, tikverr.ErrNotExist
 	}
-	return v, nil
+	return kv.ValueItem{
+		Value: rawV,
+	}, nil
 }
 
 // Get the value by given key, it returns tikverr.ErrNotExist if not exist.
 // The priority of the value is MemBuffer > flushingMemDB > flushed memdbs.
 func (p *PipelinedMemDB) Get(ctx context.Context, k []byte) ([]byte, error) {
-	return p.get(ctx, k, false)
+	v, err := p.get(ctx, k, false)
+	return v.Value, err
 }
 
 // GetLocal implements the MemBuffer interface.
 // It only checks the mutable memdb and the immutable memdb.
 // It does not check mutations that have been flushed to TiKV.
 func (p *PipelinedMemDB) GetLocal(ctx context.Context, key []byte) ([]byte, error) {
-	return p.get(ctx, key, true)
+	v, err := p.get(ctx, key, true)
+	return v.Value, err
 }
 
 func (p *PipelinedMemDB) GetFlags(k []byte) (kv.KeyFlags, error) {
@@ -200,10 +204,10 @@ func (p *PipelinedMemDB) GetFlags(k []byte) (kv.KeyFlags, error) {
 	return f, nil
 }
 
-func (p *PipelinedMemDB) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
-	m := make(map[string][]byte, len(keys))
+func (p *PipelinedMemDB) BatchGet(ctx context.Context, keys [][]byte) (map[string]kv.ValueItem, error) {
+	m := make(map[string]kv.ValueItem, len(keys))
 	if p.batchGetCache == nil {
-		p.batchGetCache = make(map[string]util.Option[[]byte], len(keys))
+		p.batchGetCache = make(map[string]util.Option[kv.ValueItem], len(keys))
 	}
 	shrinkKeys := make([][]byte, 0, len(keys))
 	for _, k := range keys {
@@ -215,8 +219,8 @@ func (p *PipelinedMemDB) BatchGet(ctx context.Context, keys [][]byte) (map[strin
 			}
 			return nil, err
 		}
-		m[string(k)] = v
-		p.batchGetCache[string(k)] = util.Some(v)
+		m[string(k)] = kv.ValueItem{Value: v}
+		p.batchGetCache[string(k)] = util.Some(kv.ValueItem{Value: v})
 	}
 	storageValues, err := p.bufferBatchGetter(ctx, shrinkKeys)
 	if err != nil {
@@ -226,13 +230,13 @@ func (p *PipelinedMemDB) BatchGet(ctx context.Context, keys [][]byte) (map[strin
 		v, ok := storageValues[string(k)]
 		if ok {
 			// the protobuf cast empty byte slice to nil, we need to cast it back when receiving values from storage.
-			if v == nil {
-				v = []byte{}
+			if v.Value == nil {
+				v.Value = []byte{}
 			}
 			m[string(k)] = v
 			p.batchGetCache[string(k)] = util.Some(v)
 		} else {
-			p.batchGetCache[string(k)] = util.None[[]byte]()
+			p.batchGetCache[string(k)] = util.None[kv.ValueItem]()
 		}
 	}
 	return m, nil

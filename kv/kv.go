@@ -132,3 +132,8 @@ func (ctx *LockCtx) IterateValuesNotLocked(f func([]byte, []byte)) {
 		}
 	}
 }
+
+type ValueItem struct {
+	Value    []byte
+	CommitTS uint64
+}

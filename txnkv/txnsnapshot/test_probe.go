@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/tikv/client-go/v2/config/retry"
 	"github.com/tikv/client-go/v2/internal/locate"
+	"github.com/tikv/client-go/v2/kv"
 )
 
 // SnapshotProbe exposes some snapshot utilities for testing purpose.
@@ -48,7 +49,7 @@ func (s SnapshotProbe) FormatStats() string {
 }
 
 // BatchGetSingleRegion gets a batch of keys from a region.
-func (s SnapshotProbe) BatchGetSingleRegion(bo *retry.Backoffer, region locate.RegionVerID, keys [][]byte, collectF func(k, v []byte)) error {
+func (s SnapshotProbe) BatchGetSingleRegion(bo *retry.Backoffer, region locate.RegionVerID, keys [][]byte, collectF func(k []byte, v kv.ValueItem)) error {
 	return s.batchGetSingleRegion(bo, batchKeys{region: region, keys: keys}, BatchGetSnapshotTier, collectF)
 }
 

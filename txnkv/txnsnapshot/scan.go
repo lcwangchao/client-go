@@ -188,7 +188,8 @@ func (s *Scanner) resolveCurrentLock(bo *retry.Backoffer, current *kvrpcpb.KvPai
 		return err
 	}
 	current.Error = nil
-	current.Value = val
+	current.Value = val.Value
+	current.CommitTs = val.CommitTS
 	return nil
 }
 

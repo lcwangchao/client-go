@@ -38,6 +38,7 @@ import (
 	"context"
 
 	"github.com/tikv/client-go/v2/internal/unionstore"
+	"github.com/tikv/client-go/v2/kv"
 )
 
 // BatchBufferGetter is the interface for BatchGet.
@@ -50,7 +51,7 @@ type BatchBufferGetter interface {
 // BatchGetter is the interface for BatchGet.
 type BatchGetter interface {
 	// BatchGet gets a batch of values.
-	BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error)
+	BatchGet(ctx context.Context, keys [][]byte) (map[string]kv.ValueItem, error)
 }
 
 // BufferBatchGetter is the type for BatchGet with MemBuffer.
@@ -65,7 +66,7 @@ func NewBufferBatchGetter(buffer BatchBufferGetter, snapshot BatchGetter) *Buffe
 }
 
 // BatchGet gets a batch of values.
-func (b *BufferBatchGetter) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+func (b *BufferBatchGetter) BatchGet(ctx context.Context, keys [][]byte) (map[string]kv.ValueItem, error) {
 	bufferValues, err := b.buffer.BatchGet(ctx, keys)
 	if err != nil {
 		return nil, err
@@ -81,7 +82,7 @@ func (b *BufferBatchGetter) BatchGet(ctx context.Context, keys [][]byte) (map[st
 			continue
 		}
 		// the deleted key should be removed from the result, and also no need to snapshot read it again.
-		if len(val) == 0 {
+		if len(val.Value) == 0 {
 			delete(bufferValues, string(key))
 		}
 	}
@@ -113,7 +114,7 @@ func NewBufferSnapshotBatchGetter(buffer BatchSnapshotBufferGetter, snapshot Bat
 }
 
 // BatchGet gets a batch of values.
-func (b *BufferSnapshotBatchGetter) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+func (b *BufferSnapshotBatchGetter) BatchGet(ctx context.Context, keys [][]byte) (map[string]kv.ValueItem, error) {
 	bufferValues, err := b.buffer.BatchGet(ctx, keys)
 	if err != nil {
 		return nil, err
@@ -129,7 +130,7 @@ func (b *BufferSnapshotBatchGetter) BatchGet(ctx context.Context, keys [][]byte)
 			continue
 		}
 		// the deleted key should be removed from the result, and also no need to snapshot read it again.
-		if len(val) == 0 {
+		if len(val.Value) == 0 {
 			delete(bufferValues, string(key))
 		}
 	}

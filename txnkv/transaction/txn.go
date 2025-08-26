@@ -39,6 +39,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tikv/client-go/v2/oracle"
 	"math"
 	"math/rand"
 	"runtime/trace"
@@ -211,6 +212,8 @@ type KVTxn struct {
 	flushBatchDurationEWMA ewma.MovingAverage
 
 	prewriteEncounterLockPolicy PrewriteEncounterLockPolicy
+
+	minCommitTS uint64
 }
 
 // NewTiKVTxn creates a new KVTxn.
@@ -287,7 +290,7 @@ func (txn *KVTxn) Get(ctx context.Context, k []byte) ([]byte, error) {
 // BatchGet gets kv from the memory buffer of statement and transaction, and the kv storage.
 // Do not use len(value) == 0 or value == nil to represent non-exist.
 // If a key doesn't exist, there shouldn't be any corresponding entry in the result map.
-func (txn *KVTxn) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+func (txn *KVTxn) BatchGet(ctx context.Context, keys [][]byte) (map[string]tikv.ValueItem, error) {
 	return NewBufferBatchGetter(txn.GetMemBuffer(), txn.GetSnapshot()).BatchGet(ctx, keys)
 }
 
@@ -529,6 +532,12 @@ func (txn *KVTxn) SetPrewriteEncounterLockPolicy(policy PrewriteEncounterLockPol
 	txn.prewriteEncounterLockPolicy = policy
 }
 
+func (txn *KVTxn) SetMinCommitTS(minCommitTS uint64) {
+	if minCommitTS > txn.minCommitTS {
+		txn.minCommitTS = minCommitTS
+	}
+}
+
 // IsPessimistic returns true if it is pessimistic.
 func (txn *KVTxn) IsPessimistic() bool {
 	return txn.isPessimistic
@@ -567,7 +576,7 @@ func (txn *KVTxn) InitPipelinedMemDB() error {
 	// generation is increased when the memdb is flushed to kv store.
 	// note the first generation is 1, which can mark pipelined dml's lock.
 	flushedKeys, flushedSize := 0, 0
-	pipelinedMemDB := unionstore.NewPipelinedMemDB(func(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+	pipelinedMemDB := unionstore.NewPipelinedMemDB(func(ctx context.Context, keys [][]byte) (map[string]tikv.ValueItem, error) {
 		return txn.snapshot.BatchGetWithTier(ctx, keys, txnsnapshot.BatchGetBufferTier)
 	}, func(generation uint64, memdb *unionstore.MemDB) (err error) {
 		if atomic.LoadUint32((*uint32)(&txn.committer.ttlManager.state)) == uint32(stateClosed) {
@@ -1903,6 +1912,32 @@ func (txn *KVTxn) SetExplicitRequestSourceType(tp string) {
 // MemHookSet returns whether the mem buffer has a memory footprint change hook set.
 func (txn *KVTxn) MemHookSet() bool {
 	return txn.us.GetMemBuffer().MemHookSet()
+}
+
+func (txn *KVTxn) GetTimestampForCommit(bo *retry.Backoffer, scope string) (uint64, error) {
+	ts, err := txn.store.GetTimestampWithRetry(bo, scope)
+	if err != nil {
+		return ts, err
+	}
+
+	for retryTimes := 0; ts <= txn.minCommitTS && retryTimes < 2; retryTimes++ {
+		interval := oracle.GetTimeFromTS(txn.minCommitTS).Sub(oracle.GetTimeFromTS(ts))
+		if interval > time.Second {
+			return 0, errors.Errorf("commit_ts(%d) << min_commit_ts(%d), interval more than 1 second", ts, txn.minCommitTS)
+		}
+
+		if interval < time.Millisecond {
+			interval = time.Millisecond
+		}
+
+		time.Sleep(interval)
+		ts, err = txn.store.GetTimestampWithRetry(bo, scope)
+		if err != nil {
+			return ts, err
+		}
+	}
+
+	return ts, err
 }
 
 // LifecycleHooks is a struct that contains hooks for a background goroutine.

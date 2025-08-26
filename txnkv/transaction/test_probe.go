@@ -70,7 +70,7 @@ func (txn TxnProbe) CollectLockedKeys() [][]byte {
 }
 
 // BatchGetSingleRegion gets a batch of keys from a region.
-func (txn TxnProbe) BatchGetSingleRegion(bo *retry.Backoffer, region locate.RegionVerID, keys [][]byte, collect func([]byte, []byte)) error {
+func (txn TxnProbe) BatchGetSingleRegion(bo *retry.Backoffer, region locate.RegionVerID, keys [][]byte, collect func([]byte, kv.ValueItem)) error {
 	snapshot := txnsnapshot.SnapshotProbe{KVSnapshot: txn.GetSnapshot()}
 
 	return snapshot.BatchGetSingleRegion(bo, region, keys, collect)

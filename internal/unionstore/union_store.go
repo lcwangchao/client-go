@@ -178,7 +178,7 @@ type MemBuffer interface {
 	// It makes nonsense for MemDB, but makes a difference for pipelined DML.
 	GetLocal(context.Context, []byte) ([]byte, error)
 	// BatchGet gets the values for given keys from the MemBuffer and cache the result if there are remote buffer.
-	BatchGet(context.Context, [][]byte) (map[string][]byte, error)
+	BatchGet(context.Context, [][]byte) (map[string]kv.ValueItem, error)
 	// GetFlags gets the flags for key k from the MemBuffer.
 	GetFlags([]byte) (kv.KeyFlags, error)
 	// Set sets the value for key k in the MemBuffer.

@@ -38,6 +38,7 @@ import (
 	"context"
 
 	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/kv"
 )
 
 type mockSnapshot struct {
@@ -52,8 +53,8 @@ func (s *mockSnapshot) SetPriority(priority int) {
 
 }
 
-func (s *mockSnapshot) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
-	m := make(map[string][]byte, len(keys))
+func (s *mockSnapshot) BatchGet(ctx context.Context, keys [][]byte) (map[string]kv.ValueItem, error) {
+	m := make(map[string]kv.ValueItem, len(keys))
 	for _, k := range keys {
 		v, err := s.store.Get(ctx, k)
 		if tikverr.IsErrNotFound(err) {
@@ -62,7 +63,7 @@ func (s *mockSnapshot) BatchGet(ctx context.Context, keys [][]byte) (map[string]
 		if err != nil {
 			return nil, err
 		}
-		m[string(k)] = v
+		m[string(k)] = kv.ValueItem{Value: v}
 	}
 	return m, nil
 }

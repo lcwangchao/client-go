@@ -130,11 +130,11 @@ func (db *rbtDBWithContext) GetMemDB() *MemDB {
 }
 
 // BatchGet returns the values for given keys from the MemBuffer.
-func (db *rbtDBWithContext) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
+func (db *rbtDBWithContext) BatchGet(ctx context.Context, keys [][]byte) (map[string]kv.ValueItem, error) {
 	if db.Len() == 0 {
-		return map[string][]byte{}, nil
+		return map[string]kv.ValueItem{}, nil
 	}
-	m := make(map[string][]byte, len(keys))
+	m := make(map[string]kv.ValueItem, len(keys))
 	for _, k := range keys {
 		v, err := db.Get(ctx, k)
 		if err != nil {
@@ -143,7 +143,7 @@ func (db *rbtDBWithContext) BatchGet(ctx context.Context, keys [][]byte) (map[st
 			}
 			return nil, err
 		}
-		m[string(k)] = v
+		m[string(k)] = kv.ValueItem{Value: v}
 	}
 	return m, nil
 }

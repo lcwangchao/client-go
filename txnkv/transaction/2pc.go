@@ -1759,10 +1759,10 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 	// all nodes, we have to make sure the commit TS of this transaction is greater
 	// than the snapshot TS of all existent readers. So we get a new timestamp
 	// from PD and plus one as our MinCommitTS.
-	if commitTSMayBeCalculated && c.needLinearizability() {
+	if commitTSMayBeCalculated && (c.needLinearizability() || c.txn.minCommitTS > 0) {
 		util.EvalFailpoint("getMinCommitTSFromTSO")
 		start := time.Now()
-		latestTS, err := c.store.GetTimestampWithRetry(bo, c.txn.GetScope())
+		latestTS, err := c.txn.GetTimestampForCommit(bo, c.txn.GetScope())
 		// If we fail to get a timestamp from PD, we just propagate the failure
 		// instead of falling back to the normal 2PC because a normal 2PC will
 		// also be likely to fail due to the same timestamp issue.
@@ -1897,7 +1897,7 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 	} else {
 		start = time.Now()
 		logutil.Event(ctx, "start get commit ts")
-		commitTS, err = c.store.GetTimestampWithRetry(retry.NewBackofferWithVars(ctx, TsoMaxBackoff, c.txn.vars), c.txn.GetScope())
+		commitTS, err = c.txn.GetTimestampForCommit(retry.NewBackofferWithVars(ctx, TsoMaxBackoff, c.txn.vars), c.txn.GetScope())
 		if err != nil {
 			logutil.Logger(ctx).Warn("2PC get commitTS failed",
 				zap.Error(err),
