@@ -20,6 +20,9 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +35,7 @@ import (
 	"github.com/tikv/client-go/v2/internal/client"
 	"github.com/tikv/client-go/v2/internal/locate"
 	"github.com/tikv/client-go/v2/internal/logutil"
+	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/metrics"
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikvrpc"
@@ -46,7 +50,15 @@ const ResolvedCacheSize = 2048
 const (
 	getTxnStatusMaxBackoff     = 20000
 	asyncResolveLockMaxBackoff = 40000
+	txnStatusTraceMaxFrames    = 8
+	txnStatusTraceHistoryLimit = 8
 )
+
+type resolvedTxnStatusDebug struct {
+	trace      string
+	primaryKey []byte
+	history    []string
+}
 
 type storage interface {
 	// GetRegionCache gets the RegionCache.
@@ -72,6 +84,7 @@ type LockResolver struct {
 		resolvingConcurrency map[uint64]int
 		// resolved caches resolved txns (FIFO, txn id -> txnStatus).
 		resolved       map[uint64]TxnStatus
+		resolvedDebug  map[uint64]resolvedTxnStatusDebug
 		recentResolved *list.List
 	}
 	testingKnobs struct {
@@ -99,6 +112,7 @@ func NewLockResolver(store storage) *LockResolver {
 		resolveLockLiteThreshold: config.GetGlobalConfig().TiKVClient.ResolveLockLiteThreshold,
 	}
 	r.mu.resolved = make(map[uint64]TxnStatus)
+	r.mu.resolvedDebug = make(map[uint64]resolvedTxnStatusDebug)
 	r.mu.resolving = make(map[uint64][][]Lock)
 	r.mu.resolvingConcurrency = make(map[uint64]int)
 	r.mu.recentResolved = list.New()
@@ -224,32 +238,74 @@ func NewLock(l *kvrpcpb.LockInfo) *Lock {
 }
 
 func (lr *LockResolver) saveResolved(txnID uint64, status TxnStatus) {
+	lr.saveResolvedWithTrace(txnID, status, nil, "")
+}
+
+func (lr *LockResolver) saveResolvedWithTrace(txnID uint64, status TxnStatus, primaryKey []byte, trace string) {
 	if !status.IsStatusDetermined() {
 		logutil.BgLogger().Error("unexpected undetermined status saved to cache",
 			zap.Uint64("txnID", txnID), zap.Stringer("status", status), zap.Stack("stack"))
 		panic("unexpected undetermined status saved to cache")
 	}
 	lr.mu.Lock()
-	defer lr.mu.Unlock()
 
 	if savedStatus, ok := lr.mu.resolved[txnID]; ok {
+		debugInfo := lr.mu.resolvedDebug[txnID]
 		// The saved determined status should always equal to the new one.
 		if !(savedStatus.HasSameDeterminedStatus(status)) {
+			debugInfo.history = appendTraceHistory(debugInfo.history, formatResolvedHistoryEvent("mismatch-save", status, primaryKey, trace))
+			lr.mu.resolvedDebug[txnID] = debugInfo
+			existingHistory := append([]string(nil), debugInfo.history...)
+			existingPrimaryKey := cloneBytes(debugInfo.primaryKey)
+			existingTrace := debugInfo.trace
+			newPrimaryKey := cloneBytes(primaryKey)
+			resolvedCacheSize := len(lr.mu.resolved)
+			lr.mu.Unlock()
+			existingPrimaryMvcc := lr.getMvccByKeyDebugInfo(existingPrimaryKey)
+			newPrimaryMvcc := existingPrimaryMvcc
+			if !bytes.Equal(existingPrimaryKey, newPrimaryKey) {
+				newPrimaryMvcc = lr.getMvccByKeyDebugInfo(newPrimaryKey)
+			}
 			logutil.BgLogger().Error("unexpected txn status saving to the cache, the existing status is not equal to the new one",
 				zap.Uint64("txnID", txnID),
 				zap.String("existing status", savedStatus.String()),
-				zap.String("new status", status.String()))
+				zap.String("new status", status.String()),
+				zap.String("existing primary", redact.Key(existingPrimaryKey)),
+				zap.String("new primary", redact.Key(newPrimaryKey)),
+				zap.String("existing trace", existingTrace),
+				zap.String("new trace", trace),
+				zap.String("existing primary mvcc", existingPrimaryMvcc),
+				zap.String("new primary mvcc", newPrimaryMvcc),
+				zap.Strings("resolved cache history", existingHistory),
+				zap.Int("resolved cache size", resolvedCacheSize))
 			panic("unexpected txn status saved to cache with existing different entry")
 		}
+		if trace != "" && debugInfo.trace == "" {
+			debugInfo.trace = trace
+		}
+		if len(debugInfo.primaryKey) == 0 && len(primaryKey) > 0 {
+			debugInfo.primaryKey = cloneBytes(primaryKey)
+		}
+		debugInfo.history = appendTraceHistory(debugInfo.history, formatResolvedHistoryEvent("duplicate-save", status, primaryKey, trace))
+		lr.mu.resolvedDebug[txnID] = debugInfo
+		lr.mu.Unlock()
 		return
 	}
 	lr.mu.resolved[txnID] = status
+	lr.mu.resolvedDebug[txnID] = resolvedTxnStatusDebug{
+		trace:      trace,
+		primaryKey: cloneBytes(primaryKey),
+		history:    appendTraceHistory(nil, formatResolvedHistoryEvent("save", status, primaryKey, trace)),
+	}
 	lr.mu.recentResolved.PushBack(txnID)
 	if len(lr.mu.resolved) > ResolvedCacheSize {
 		front := lr.mu.recentResolved.Front()
-		delete(lr.mu.resolved, front.Value.(uint64))
+		evictedTxnID := front.Value.(uint64)
+		delete(lr.mu.resolved, evictedTxnID)
+		delete(lr.mu.resolvedDebug, evictedTxnID)
 		lr.mu.recentResolved.Remove(front)
 	}
+	lr.mu.Unlock()
 }
 
 func (lr *LockResolver) getResolved(txnID uint64) (TxnStatus, bool) {
@@ -258,6 +314,266 @@ func (lr *LockResolver) getResolved(txnID uint64) (TxnStatus, bool) {
 
 	s, ok := lr.mu.resolved[txnID]
 	return s, ok
+}
+
+func (lr *LockResolver) recordResolvedCacheHit(txnID uint64, status TxnStatus, primaryKey []byte, trace string) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+
+	debugInfo, ok := lr.mu.resolvedDebug[txnID]
+	if !ok {
+		return
+	}
+	if len(debugInfo.primaryKey) == 0 && len(primaryKey) > 0 {
+		debugInfo.primaryKey = cloneBytes(primaryKey)
+	}
+	debugInfo.history = appendTraceHistory(debugInfo.history, formatResolvedHistoryEvent("cache-hit", status, primaryKey, trace))
+	lr.mu.resolvedDebug[txnID] = debugInfo
+}
+
+func (lr *LockResolver) appendResolvedHistoryLocked(txnID uint64, event string) {
+	debugInfo := lr.mu.resolvedDebug[txnID]
+	debugInfo.history = appendTraceHistory(debugInfo.history, event)
+	lr.mu.resolvedDebug[txnID] = debugInfo
+}
+
+func appendTraceHistory(history []string, event string) []string {
+	history = append(history, event)
+	if len(history) > txnStatusTraceHistoryLimit {
+		history = history[len(history)-txnStatusTraceHistoryLimit:]
+	}
+	return history
+}
+
+func captureTxnStatusTraceStack(skip, maxFrames int) string {
+	pcs := make([]uintptr, maxFrames)
+	n := runtime.Callers(skip, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+
+	var b strings.Builder
+	for i := 0; i < maxFrames; i++ {
+		frame, more := frames.Next()
+		if i > 0 {
+			b.WriteString(" <= ")
+		}
+		fmt.Fprintf(&b, "%s@%s:%d", frame.Function, filepath.Base(frame.File), frame.Line)
+		if !more {
+			break
+		}
+	}
+	return b.String()
+}
+
+func formatResolvedHistoryEvent(kind string, status TxnStatus, primaryKey []byte, trace string) string {
+	return fmt.Sprintf(
+		"at=%s kind=%s status=%q primary=%s trace=%q",
+		time.Now().Format(time.RFC3339Nano),
+		kind,
+		status.String(),
+		redact.Key(primaryKey),
+		trace,
+	)
+}
+
+func cloneBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return append([]byte(nil), b...)
+}
+
+func formatMvccBytes(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	const maxLen = 64
+	if len(b) <= maxLen {
+		return redact.Key(b)
+	}
+	return fmt.Sprintf("%s...(len=%d)", redact.Key(b[:maxLen]), len(b))
+}
+
+func formatMvccInfo(info *kvrpcpb.MvccInfo) string {
+	if info == nil {
+		return "info=nil"
+	}
+	var b strings.Builder
+	if lock := info.GetLock(); lock != nil {
+		fmt.Fprintf(
+			&b,
+			"lock={type:%s start_ts:%d primary:%s short_value:%s}",
+			lock.GetType(),
+			lock.GetStartTs(),
+			redact.Key(lock.GetPrimary()),
+			formatMvccBytes(lock.GetShortValue()),
+		)
+	} else {
+		b.WriteString("lock=nil")
+	}
+	b.WriteString(" writes=[")
+	for i, w := range info.GetWrites() {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(
+			&b,
+			"{type:%s start_ts:%d commit_ts:%d short_value:%s}",
+			w.GetType(),
+			w.GetStartTs(),
+			w.GetCommitTs(),
+			formatMvccBytes(w.GetShortValue()),
+		)
+	}
+	b.WriteString("] values=[")
+	for i, v := range info.GetValues() {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "{start_ts:%d value:%s}", v.GetStartTs(), formatMvccBytes(v.GetValue()))
+	}
+	b.WriteString("]")
+	return b.String()
+}
+
+func (lr *LockResolver) getMvccByKeyDebugInfo(key []byte) string {
+	if len(key) == 0 {
+		return "key-empty"
+	}
+	if lr.store == nil {
+		return "store-nil"
+	}
+	bo := retry.NewBackoffer(context.Background(), getTxnStatusMaxBackoff)
+	req := tikvrpc.NewRequest(tikvrpc.CmdMvccGetByKey, &kvrpcpb.MvccGetByKeyRequest{Key: key})
+	req.MaxExecutionDurationMs = uint64(client.ReadTimeoutMedium.Milliseconds())
+	for {
+		loc, err := lr.store.GetRegionCache().LocateKey(bo, key)
+		if err != nil {
+			return fmt.Sprintf("locate-key-failed err=%v", err)
+		}
+		rpcCtx, _ := lr.store.GetRegionCache().GetTiKVRPCContext(bo, loc.Region, kv.ReplicaReadLeader, 0)
+		resp, err := lr.store.SendReq(bo, req, loc.Region, client.ReadTimeoutMedium)
+		if err != nil {
+			return fmt.Sprintf("send-req-failed err=%v key_location=%q rpc_ctx=%q", err, loc.String(), rpcCtx)
+		}
+		regionErr, err := resp.GetRegionError()
+		if err != nil {
+			return fmt.Sprintf("get-region-error-failed err=%v key_location=%q rpc_ctx=%q", err, loc.String(), rpcCtx)
+		}
+		if regionErr != nil {
+			if err = bo.Backoff(retry.BoRegionMiss, errors.New(regionErr.String())); err != nil {
+				return fmt.Sprintf("region-error=%s backoff-failed=%v key_location=%q rpc_ctx=%q", regionErr.String(), err, loc.String(), rpcCtx)
+			}
+			continue
+		}
+		if resp.Resp == nil {
+			return fmt.Sprintf("resp-body-missing key_location=%q rpc_ctx=%q", loc.String(), rpcCtx)
+		}
+		mvccResp := resp.Resp.(*kvrpcpb.MvccGetByKeyResponse)
+		if mvccErr := mvccResp.GetError(); mvccErr != "" {
+			return fmt.Sprintf("mvcc-error=%q key_location=%q rpc_ctx=%q", mvccErr, loc.String(), rpcCtx)
+		}
+		return fmt.Sprintf(
+			"key=%s key_location=%q rpc_ctx=%q mvcc=%s",
+			redact.Key(key),
+			loc.String(),
+			rpcCtx,
+			formatMvccInfo(mvccResp.GetInfo()),
+		)
+	}
+}
+
+func formatGetTxnStatusTrace(
+	bo *retry.Backoffer,
+	txnID uint64,
+	primary []byte,
+	callerStartTS, currentTS uint64,
+	rollbackIfNotExist, forceSyncCommit bool,
+	lockInfo *Lock,
+	loc *locate.KeyLocation,
+	rpcCtx *locate.RPCContext,
+	status TxnStatus,
+) string {
+	var b strings.Builder
+	fmt.Fprintf(
+		&b,
+		"source=getTxnStatus txn_id=%d request_source=%q resource_group=%q caller_start_ts=%d current_ts=%d rollback_if_not_exist=%t force_sync_commit=%t primary=%s",
+		txnID,
+		util.RequestSourceFromCtx(bo.GetCtx()),
+		util.ResourceGroupNameFromCtx(bo.GetCtx()),
+		callerStartTS,
+		currentTS,
+		rollbackIfNotExist,
+		forceSyncCommit,
+		redact.Key(primary),
+	)
+	if lockInfo != nil {
+		fmt.Fprintf(&b, " lock=%q", lockInfo.String())
+	}
+	if loc != nil {
+		fmt.Fprintf(&b, " key_location=%q bucket_version=%d", loc.String(), loc.GetBucketVersion())
+	}
+	if rpcCtx != nil {
+		if rpcCtx.Peer != nil {
+			fmt.Fprintf(&b, " peer_id=%d", rpcCtx.Peer.GetId())
+		}
+		if rpcCtx.Store != nil {
+			fmt.Fprintf(&b, " store_id=%d", rpcCtx.Store.StoreID())
+		}
+		fmt.Fprintf(&b, " store_addr=%q access_idx=%d rpc_ctx=%q", rpcCtx.Addr, rpcCtx.AccessIdx, rpcCtx.String())
+	}
+	fmt.Fprintf(&b, " status=%q", status.String())
+	if status.primaryLock != nil {
+		fmt.Fprintf(&b, " response_primary_lock=%q secondary_num=%d", NewLock(status.primaryLock).String(), len(status.primaryLock.Secondaries))
+	}
+	fmt.Fprintf(&b, " stack=%s", captureTxnStatusTraceStack(4, txnStatusTraceMaxFrames))
+	return b.String()
+}
+
+func formatAsyncResolveTrace(bo *retry.Backoffer, l *Lock, status TxnStatus) string {
+	var b strings.Builder
+	fmt.Fprintf(
+		&b,
+		"source=checkAllSecondaries txn_id=%d request_source=%q resource_group=%q lock=%q status=%q",
+		l.TxnID,
+		util.RequestSourceFromCtx(bo.GetCtx()),
+		util.ResourceGroupNameFromCtx(bo.GetCtx()),
+		l.String(),
+		status.String(),
+	)
+	if status.primaryLock != nil {
+		fmt.Fprintf(&b, " primary_lock=%q secondary_num=%d", NewLock(status.primaryLock).String(), len(status.primaryLock.Secondaries))
+	}
+	fmt.Fprintf(&b, " stack=%s", captureTxnStatusTraceStack(4, txnStatusTraceMaxFrames))
+	return b.String()
+}
+
+func formatResolvedCacheHitTrace(
+	bo *retry.Backoffer,
+	txnID uint64,
+	primary []byte,
+	callerStartTS, currentTS uint64,
+	rollbackIfNotExist, forceSyncCommit bool,
+	lockInfo *Lock,
+	status TxnStatus,
+) string {
+	var b strings.Builder
+	fmt.Fprintf(
+		&b,
+		"source=resolvedCacheHit txn_id=%d request_source=%q resource_group=%q caller_start_ts=%d current_ts=%d rollback_if_not_exist=%t force_sync_commit=%t primary=%s",
+		txnID,
+		util.RequestSourceFromCtx(bo.GetCtx()),
+		util.ResourceGroupNameFromCtx(bo.GetCtx()),
+		callerStartTS,
+		currentTS,
+		rollbackIfNotExist,
+		forceSyncCommit,
+		redact.Key(primary),
+	)
+	if lockInfo != nil {
+		fmt.Fprintf(&b, " lock=%q", lockInfo.String())
+	}
+	fmt.Fprintf(&b, " status=%q stack=%s", status.String(), captureTxnStatusTraceStack(4, txnStatusTraceMaxFrames))
+	return b.String()
 }
 
 // BatchResolveLocks resolve locks in a batch.
@@ -783,6 +1099,12 @@ func (e primaryMismatch) Error() string {
 func (lr *LockResolver) getTxnStatus(bo *retry.Backoffer, txnID uint64, primary []byte,
 	callerStartTS, currentTS uint64, rollbackIfNotExist bool, forceSyncCommit bool, lockInfo *Lock) (TxnStatus, error) {
 	if s, ok := lr.getResolved(txnID); ok {
+		lr.recordResolvedCacheHit(
+			txnID,
+			s,
+			primary,
+			formatResolvedCacheHitTrace(bo, txnID, primary, callerStartTS, currentTS, rollbackIfNotExist, forceSyncCommit, lockInfo, s),
+		)
 		return s, nil
 	}
 
@@ -819,6 +1141,8 @@ func (lr *LockResolver) getTxnStatus(bo *retry.Backoffer, txnID uint64, primary 
 		if err != nil {
 			return status, err
 		}
+		var rpcCtx *locate.RPCContext
+		rpcCtx, _ = lr.store.GetRegionCache().GetTiKVRPCContext(bo, loc.Region, kv.ReplicaReadLeader, 0)
 		req.MaxExecutionDurationMs = uint64(client.MaxWriteExecutionTime.Milliseconds())
 		resp, err := lr.store.SendReq(bo, req, loc.Region, client.ReadTimeoutShort)
 		if err != nil {
@@ -869,7 +1193,24 @@ func (lr *LockResolver) getTxnStatus(bo *retry.Backoffer, txnID uint64, primary 
 
 			status.commitTS = cmdResp.CommitVersion
 			if status.StatusCacheable() {
-				lr.saveResolved(txnID, status)
+				lr.saveResolvedWithTrace(
+					txnID,
+					status,
+					primary,
+					formatGetTxnStatusTrace(
+						bo,
+						txnID,
+						primary,
+						callerStartTS,
+						currentTS,
+						rollbackIfNotExist,
+						forceSyncCommit,
+						lockInfo,
+						loc,
+						rpcCtx,
+						status,
+					),
+				)
 			}
 		}
 
@@ -1060,7 +1401,7 @@ func (lr *LockResolver) resolveAsyncCommitLock(bo *retry.Backoffer, l *Lock, sta
 
 		status.commitTS = resolveData.commitTs
 		if status.StatusCacheable() {
-			lr.saveResolved(l.TxnID, status)
+			lr.saveResolvedWithTrace(l.TxnID, status, l.Primary, formatAsyncResolveTrace(bo, l, status))
 		}
 		toResolveKeys = resolveData.keys
 	}
