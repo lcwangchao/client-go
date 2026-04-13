@@ -931,6 +931,13 @@ func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		}
 		resp.Resp = kvHandler{session}.handleKvScanLock(r)
 	case tikvrpc.CmdResolveLock:
+		if util.RequestSourceFromCtx(ctx) == util.InternalRequest+"_MockResolveLockBusy" {
+			return &tikvrpc.Response{
+				Resp: &kvrpcpb.ResolveLockResponse{
+					RegionError: &errorpb.Error{ServerIsBusy: &errorpb.ServerIsBusy{Reason: "mock server is busy"}},
+				},
+			}, nil
+		}
 		r := req.ResolveLock()
 		if err := session.checkRequest(reqCtx, r.Size()); err != nil {
 			resp.Resp = &kvrpcpb.ResolveLockResponse{RegionError: err}
