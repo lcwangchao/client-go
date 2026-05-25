@@ -112,6 +112,8 @@ type TiKVClient struct {
 	// TTLRefreshedTxnSize controls whether a transaction should update its TTL or not.
 	TTLRefreshedTxnSize      int64  `toml:"ttl-refreshed-txn-size" json:"ttl-refreshed-txn-size"`
 	ResolveLockLiteThreshold uint64 `toml:"resolve-lock-lite-threshold" json:"resolve-lock-lite-threshold"`
+	// ResolveLockCollapseBuckets is the bucket count for collapsing ResolveLock requests.
+	ResolveLockCollapseBuckets int64 `toml:"resolve-lock-collapse-buckets" json:"resolve-lock-collapse-buckets"`
 	// MaxConcurrencyRequestLimit is the max concurrency number of request to be sent the tikv
 	// 0 means auto adjust by feedback.
 	MaxConcurrencyRequestLimit int64 `toml:"max-concurrency-request-limit" json:"max-concurrency-request-limit"`
@@ -229,6 +231,7 @@ func DefaultTiKVClient() TiKVClient {
 		CoprReqTimeout: 60 * time.Second,
 
 		ResolveLockLiteThreshold:   16,
+		ResolveLockCollapseBuckets: 16,
 		MaxConcurrencyRequestLimit: DefMaxConcurrencyRequestLimit,
 		EnableReplicaSelectorV2:    true,
 		RUV2:                       DefaultRUV2TiKVConfig(),
@@ -245,6 +248,9 @@ func (config *TiKVClient) Valid() error {
 	}
 	if config.GetGrpcKeepAliveTimeout() < time.Millisecond*50 {
 		return fmt.Errorf("grpc-keepalive-timeout should be at least 0.05, but got %f", config.GrpcKeepAliveTimeout)
+	}
+	if config.ResolveLockCollapseBuckets <= 0 {
+		return fmt.Errorf("resolve-lock-collapse-buckets should be greater than 0")
 	}
 	return nil
 }
